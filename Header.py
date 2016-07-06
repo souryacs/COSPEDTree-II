@@ -1,30 +1,44 @@
 #!/usr/bin/env python
 
 import dendropy
-from dendropy import Tree, Taxon, TaxonSet, Node
+from dendropy import TreeList, Tree, Taxon, TaxonSet, Node
 import numpy
 import time
 import os
+from cStringIO import StringIO
 from optparse import OptionParser
-#import sys
-import math
+import copy
+import networkx as nx
+#import matplotlib.pyplot as plt
 
-# we define custom edge types
-RELATION_R3 = 0	# equality relationship
+"""
+following variables denote different relations between a couplet
+"""
+"""
+for a couplet (x,y), R3(x,y) means x and y are siblings
+"""
+RELATION_R3 = 0	
+"""
+for a couplet (x,y), R1(x,y) means LCA(x,y) = parent node of x
+"""
 RELATION_R1 = 1
+"""
+for a couplet (x,y), R2(x,y) means R1(y,x)
+"""
 RELATION_R2 = 2
-RELATION_R4 = 3	# no relationship
+"""
+for a couplet (x,y), R4(x,y) means x and y have independent evolution
+"""
+RELATION_R4 = 3
 UNDEFINED_RELATION = 4
 
-# variables used to denote whether we use traditional NJ method
-# or use a variant of it, namely the agglomerative clustering
+"""
+Two types of NJ methods are explored:
+1) traditional NJ method with difference of distance values
+2) Normalized / ratio of distance values
+"""
 TRADITIONAL_NJ = 1
 AGGLO_CLUST = 2
-
-## variables used to denote the distance metric employed for agglomerative clustering
-#EXTRA_TAXA = 1
-#PROD_EXTRA_TAXA_BRANCH_COUNT = 2
-#PROD_EXTRA_TAXA_ACC_RANK = 3
 
 #---------------------------------------------
 """ 
@@ -32,6 +46,11 @@ this is a dictionary for storing information about individual taxa clusters
 each cluster is basically a collection of taxa related via relation r3
 """
 Cluster_Info_Dict = dict()
+
+"""
+this is a dictionary containing information of a pair of taxa clusters
+"""
+Cluster_Pair_Info_Dict = dict()
 
 """ 
 the dictionary defines one particular taxa and its associated information
@@ -44,18 +63,12 @@ each entry of this dictionary is indexed by a pair of taxon labels
 """
 TaxaPair_Reln_Dict = dict()
 
+#--------------------------------------------------
 """
-queue storing relations of non-conflicting couplets (supporting only one type of relation 
-in the input trees)
+queue storing relations of individual couplets
 """
-Cost_List_Taxa_Pair_Single_Reln = []
-
-"""
-queue storing relations of conflicting couplets (supporting more than one type of relation 
-in the input trees)
-"""
-Cost_List_Taxa_Pair_Multi_Reln = []
-
+Queue_Score_Couplet = []
+#--------------------------------------------------
 """ 
 this list contains the complete set of taxa present in the input trees 
 """
@@ -72,33 +85,15 @@ set for printing the necessary information
 """
 DEBUG_LEVEL = 2
 
-# add - sourya
-MODE_PERCENT = 0.25	#0.4 #0.35	#0.5 
-MODE_BIN_COUNT = 40
+#"""
+#this is the percentage of consensus relation frequency
+#that a relation must possess to be included as a candidate relation between a cluster pair
+#"""
+#PERCENT_MAX_FREQ1 = 0.5
+#PERCENT_MAX_FREQ2 = 0.7
 
+#-----------------------------------------------------
 """
-this is a threshold corresponding to the selection of R1 or R2 relation
-for a non conflicting couplet with negative support score of the corresponding relation
-"""
-R1R2Reln_MAJ_THRS_high = 0.75	#0.8
-R1R2Reln_MAJ_THRS_low = 0.65	#0.7	#0.8
-R1R2Reln_MAJ_THRS_very_low = 0.6	#0.65
-
-"""
-for a couplet, relations with frequency of this percentage of the 
-max (consensus) frequency, will be included in the score queue
-currently we employ 50% frequency threshold
-"""
-PERCENT_MAX_FREQ = 0.7
-
-"""
-this list contains the set of clusters 
-which need to be processed for setting at least one directed out edge to another cluster
-"""
-Candidate_Out_Edge_Cluster_List = []
-
-##-----------------------------------------------------
-""" 
 this class defines a leaf node of input candidate source trees
 that is, it corresponds to one taxa 
 """
@@ -110,6 +105,16 @@ class Single_Taxa(object):
 		otherwise it is part of a valid cluster 
 		"""
 		self.clust_idx_part = -1
+		"""
+		this list stores the indices of input trees having this taxon
+		"""
+		self.Support_Tree_List = []
+
+	def _AddSupportTree(self, idx):
+		self.Support_Tree_List.append(idx)
+		
+	def _GetSupportTreeList(self):
+		return self.Support_Tree_List
 
 	def _Get_Taxa_Part_Clust_Idx(self):
 		return self.clust_idx_part
@@ -121,6 +126,7 @@ class Single_Taxa(object):
 	def _PrintFinalTaxaInfo(self, key, Output_Text_File):
 		fp = open(Output_Text_File, 'a')    
 		fp.write('\n taxa key: ' + str(key))
+		fp.write('\n taxa label: ' + str(COMPLETE_INPUT_TAXA_LIST[key]))
 		fp.write('\n taxa is part of the cluster ID: ' + str(self.clust_idx_part))
 		fp.close()
 
@@ -157,19 +163,15 @@ class Reln_TaxaPair(object):
 		"""
 		self.supporting_trees = 0
 		"""
+		this list maintains the consensus relations for this couplet
+		with respect to the input trees
+		"""
+		self.consensus_reln_list = []
+		"""
 		this list contains the union of taxa list underlying the LCA of this couplet
 		for individual input trees
 		"""
 		self.LCA_Underlying_Taxa_List = []
-		"""
-		for a couplet xy, and for a relation r3, following array has 3 elements:
-		1) count when level of x < level of y (relation r1 similar)
-		2) count when level of x > level of y (relation r2 similar)
-		3) count when level of x = level of y (relation r3 similar)
-		"""
-		self.ALL_Reln_Level_Diff_Info_Count = [0] * 3
-		self.ALL_Reln_Level_Diff_Val_Count = [0] * 3
-		
 		"""
 		this is a variable containing the binned average of the XL values
 		of very high frequency
@@ -177,78 +179,39 @@ class Reln_TaxaPair(object):
 		once the computation (for a couplet) is done, the value is subsequently used and returned
 		"""
 		self.binned_avg_XL = -1
-		
 		"""
-		this is a list containing the number of instances
-		when R4 relation is actually a pseudo R1 relation
+		allowed relation list which are included in the support score queue
 		"""
-		self.freq_R4_pseudo_R1R2 = [0] * 2
-		"""
-		this is a list of allowed relations between this couplet
-		we allow only those relations which have a significant frequency 
-		compared to the number of supporting trees
-		"""
-		self.allowed_reln_list = []
-		
-		"""
-		this list contains the sorted frequency count in descending order
-		starting from the highest to lowest
-		"""
-		self.sorted_freq_count = [0] * 4
-
+		self.Allowed_Reln_List = []
+	
 	#----------------------------------
-	"""
-	this function creates the sorted freq list in descending order
-	starting from the highest to the lowest
-	"""
-	def _SortFreqList(self):
-		for r in range(4):
-			self.sorted_freq_count[r] = self.freq_count[r]
-		# sort the list
-		self.sorted_freq_count.sort(reverse=True)
-
-	"""
-	this function checks whether the input frequency value 
-	is either max or 2nd max frequency
-	from all different relations and corresponding frequency values
-	"""
-	def _CheckMaxor2ndMaxReln(self, inp_freq):
-		"""
-		as the sorted frequency list is stored in descending order
-		so we check whether the given frequency lies in the 1st or 2nd index
-		of course, frequency should be > 0
-		"""
-		if (inp_freq > 0):
-			if (inp_freq == self.sorted_freq_count[0]) or (inp_freq == self.sorted_freq_count[1]):
-				return 1
-		return 0
-		
-	#----------------------------------
-	"""
-	this function returns the ratio of level value
-	@param: idx: 	if 0, returns ratio w.r.t r1
-							  if 1, returns ratio w.r.t r2
-	"""
-	def _GetLevelValRatio(self, idx):
-		level_val_r1 = self.ALL_Reln_Level_Diff_Val_Count[0]
-		level_val_r2 = self.ALL_Reln_Level_Diff_Val_Count[1]
-		if (idx == 0):
-			if ((level_val_r1 + level_val_r2) > 0):
-				return (level_val_r1 * 1.0) / (level_val_r1 + level_val_r2)
-			else:
-				return 0
-		else:	#if (idx == 1):
-			if ((level_val_r1 + level_val_r2) > 0):
-				return (level_val_r2 * 1.0) / (level_val_r1 + level_val_r2)
-			else:
-				return 0
-			
-		return 0
+	def _AddAllowedReln(self, inp_reln):
+		if inp_reln not in self.Allowed_Reln_List:
+			self.Allowed_Reln_List.append(inp_reln)
+	
+	def _Check_Single_Reln_OnlyAllowed(self, inp_reln):
+		if (len(self.Allowed_Reln_List) == 1) and (inp_reln in self.Allowed_Reln_List):
+			return True
+		return False
+	
+	def _GetAllowedRelnList(self):
+		return self.Allowed_Reln_List
+	
+	def _CheckInpRelnAllowed(self, inp_reln):
+		if inp_reln in self.Allowed_Reln_List:
+			return True
+		return False
+	
 	#----------------------------------
 	"""
 	Appends underlying taxon set of the LCA node for this couplet
+	Note: we store the index of individual taxon, with respect to the COMPLETE_INPUT_TAXA_LIST
 	"""
 	def _AppendUnderlyingTaxonList(self, inp_list):
+		# comment - sourya
+		#inp_taxa_list_index = [COMPLETE_INPUT_TAXA_LIST.index(x) for x in inp_list]
+		#self.LCA_Underlying_Taxa_List = list(set(self.LCA_Underlying_Taxa_List) | set(inp_taxa_list_index))
+		# add - sourya
 		self.LCA_Underlying_Taxa_List = list(set(self.LCA_Underlying_Taxa_List) | set(inp_list))
 
 	"""
@@ -258,114 +221,6 @@ class Reln_TaxaPair(object):
 	def _GetUnderlyingTaxonList(self):
 		return self.LCA_Underlying_Taxa_List
 
-	#----------------------------------
-	"""
-	this function checks whether the 'target_reln' (RELATION_R1 or RELATION_R2) 
-	can be established between this couplet
-	"""
-	def CheckHigherPriority(self, target_reln):
-		if (target_reln == RELATION_R1):
-			if (self._CheckTargetRelnConsensus(RELATION_R1) == True):
-				if (self.ALL_Reln_Level_Diff_Info_Count[0] == max(self.ALL_Reln_Level_Diff_Info_Count)):
-					if (self.ALL_Reln_Level_Diff_Val_Count[0] > self.ALL_Reln_Level_Diff_Val_Count[1]):
-						return 1
-
-		if (target_reln == RELATION_R2):
-			if (self._CheckTargetRelnConsensus(RELATION_R2) == True):
-				if (self.ALL_Reln_Level_Diff_Info_Count[1] == max(self.ALL_Reln_Level_Diff_Info_Count)):
-					if (self.ALL_Reln_Level_Diff_Val_Count[1] > self.ALL_Reln_Level_Diff_Val_Count[0]):
-						return 1
-	
-		return 0
-
-	#----------------------------------
-	"""
-	these functions adjust the set of allowed relations among a couplet
-	"""
-	def _AddAllowedReln(self, inp_reln):
-		self.allowed_reln_list.append(inp_reln)
-		
-	def _GetAllowedRelnList(self):
-		return self.allowed_reln_list
-	
-	def _RemoveAllowedReln(self, inp_reln):
-		if inp_reln in self.allowed_reln_list:
-			self.allowed_reln_list.remove(inp_reln)
-			
-	#----------------------------------
-	def _AddFreqPseudoR1(self, idx, r=1):
-		self.freq_R4_pseudo_R1R2[idx] = self.freq_R4_pseudo_R1R2[idx] + r
-		
-	def _GetFreqPseudoR1(self, idx):
-		return self.freq_R4_pseudo_R1R2[idx]
-		
-	def _NormalizeR1R2LevelDiff(self):
-		for i in range(3):
-			self.ALL_Reln_Level_Diff_Val_Count[i] = (self.ALL_Reln_Level_Diff_Val_Count[i] * 1.0) / self.supporting_trees
-		
-	#----------------------------------
-	"""
-	this function computes the level difference (relation based) count 
-	# parameters:
-	@src_reln: corresponds to the level of relation from which the subtraction will take place
-	@dest_reln: if between 0 and 2, corresponds to the subtracted relation
-	if it is -1, all relations except the src_reln will be subtracted
-	@abs_comp: if true, will compute the absolute value of the subtracted quantity
-	@norm: if true, will normalize the subtracted value with the number of supporting trees
-	"""
-	def _GetRelnLevelDiff(self, src_reln, dest_reln, abs_comp, norm):
-		reln_array = [RELATION_R1, RELATION_R2, RELATION_R3]
-		src_reln_idx = reln_array.index(src_reln)
-
-		target_val = self.ALL_Reln_Level_Diff_Info_Count[src_reln_idx]
-		
-		if (dest_reln == -1):
-			# all relations will be subtracted
-			for dest_reln_idx in range(3):
-				if (dest_reln_idx == src_reln_idx):
-					continue
-				target_val = target_val - self.ALL_Reln_Level_Diff_Info_Count[dest_reln_idx]
-		else:
-			dest_reln_idx = reln_array.index(dest_reln)
-			target_val = target_val - self.ALL_Reln_Level_Diff_Info_Count[dest_reln_idx]
-			
-		if (abs_comp == True):
-			target_val = math.fabs(target_val)
-			
-		if (norm == True):
-			target_val = (target_val * 1.0) / self.supporting_trees
-			
-		return target_val
-
-	"""
-	this function checks whether the input relation type is a consensus relation
-	among this couplet
-	"""
-	def _CheckTargetRelnConsensus(self, inp_reln_type):
-		if (self.freq_count[inp_reln_type] == max(self.freq_count)):
-			return True
-		return False
-	
-	def _CheckTargetRelnLevelConsensus(self, src_reln):
-		reln_array = [RELATION_R1, RELATION_R2, RELATION_R3]
-		src_reln_idx = reln_array.index(src_reln)
-		sum_level_count = sum(self.ALL_Reln_Level_Diff_Info_Count)
-		sum_level_val = self.ALL_Reln_Level_Diff_Val_Count[0] + self.ALL_Reln_Level_Diff_Val_Count[1]
-		if (src_reln_idx == 0) or (src_reln_idx == 1):
-			if (self.ALL_Reln_Level_Diff_Info_Count[src_reln_idx] > (0.5 * sum_level_count)) and \
-				(self.ALL_Reln_Level_Diff_Val_Count[src_reln_idx] > (0.5 * sum_level_val)):
-				return 1
-		else:
-			if (self.ALL_Reln_Level_Diff_Info_Count[2] > (self.ALL_Reln_Level_Diff_Info_Count[0] \
-				+ self.ALL_Reln_Level_Diff_Info_Count[1])):
-				return 1
-			
-		return 0
-		
-	def _IncrAllRelnLevelDiffInfoCount(self, idx, val):
-		self.ALL_Reln_Level_Diff_Info_Count[idx] = self.ALL_Reln_Level_Diff_Info_Count[idx] + 1
-		self.ALL_Reln_Level_Diff_Val_Count[idx] = self.ALL_Reln_Level_Diff_Val_Count[idx] + val
-			
 	#----------------------------------
 	"""
 	this function adds one supporting tree for this couplet
@@ -378,7 +233,15 @@ class Reln_TaxaPair(object):
 	"""
 	def _GetNoSupportTrees(self):
 		return self.supporting_trees
-		
+	
+	#----------------------------------
+	def _GetConsensusRelnList(self):
+		return self.consensus_reln_list
+	
+	def _AddConsensusRelnList(self, inp_reln):
+		if inp_reln not in self.consensus_reln_list:
+			self.consensus_reln_list.append(inp_reln)
+			
 	#----------------------------------
 	"""
 	this function adds one XL value, computed for a particular input tree
@@ -404,7 +267,7 @@ class Reln_TaxaPair(object):
 	depending on the user parameters, average, median, or binned average XL is returned
 	"""
 	def _GetNormalizedXLSumGeneTrees(self, dist_type):
-		if (dist_type == 1):
+		if (dist_type == 1) or (dist_type == 3):
 			return self._GetAvgXLGeneTrees()
 		elif (dist_type == 2):
 			# average of mean and mode
@@ -464,13 +327,31 @@ class Reln_TaxaPair(object):
 				fp.close()
 			
 		return self.binned_avg_XL
-
+	
 	#----------------------------------
 	"""
 	this function returns the frequency of the consensus relation
 	"""
 	def _GetConsensusFreq(self):
 		return max(self.freq_count)
+
+	"""
+	this function checks whether the input relation type is a consensus relation
+	among this couplet
+	"""
+	def _CheckTargetRelnConsensus(self, inp_reln_type):
+		if (self.freq_count[inp_reln_type] == max(self.freq_count)):
+			return True
+		return False
+
+	"""
+	this function checks whether the input relation type is a consensus relation
+	among this couplet
+	"""
+	def _CheckTargetRelnMajorityConsensus(self, inp_reln_type):
+		if (self.freq_count[inp_reln_type] >= (0.5 * sum(self.freq_count))):
+			return True
+		return False
 
 	"""
 	this function returns the frequency of the input relation
@@ -493,9 +374,11 @@ class Reln_TaxaPair(object):
 	"""
 	def _SetCostMetric(self):
 		for reln_type in range(4):
-			# assign the score metric for this relation type
+			"""
+			assign the score metric for this relation type
+			"""
 			self.support_score[reln_type] = self.freq_count[reln_type] * self.priority_reln[reln_type]
-	
+
 	"""
 	this function returns the support score of the input relation
 	specified by the variable 'reln_type'
@@ -510,15 +393,8 @@ class Reln_TaxaPair(object):
 	"""
 	def _IncrEdgeCost_ConnReln(self, reln_type, incr_cost):
 		self.support_score[reln_type] = self.support_score[reln_type] + incr_cost
-	
-	#----------------------------------
-	"""
-	this function returns the priority value for a given input relation 
-	specified by the variable 'reln_type'
-	"""
-	def _GetConnPrVal(self, reln_type):
-		return self.priority_reln[reln_type]
-	
+
+	#----------------------------------	
 	""" 
 	this function calculates connection priority value for 
 	each of the relation types
@@ -537,8 +413,18 @@ class Reln_TaxaPair(object):
 			here we use the difference of current relation type 
 			frequency with the frequencies of all other relations
 			"""
-			self.priority_reln[reln_type] = 2 * self.freq_count[reln_type] - listsum
-		
+			# comment - sourya
+			#self.priority_reln[reln_type] = 2 * self.freq_count[reln_type] - listsum
+			# add - sourya
+			self.priority_reln[reln_type] = ((self.freq_count[reln_type] * 1.0) / listsum)
+			
+	"""
+	this function returns the priority value for a given input relation 
+	specified by the variable 'reln_type'
+	"""
+	def _GetConnPrVal(self, reln_type):
+		return self.priority_reln[reln_type]
+	
 	"""
 	this function checks whether a couplet is non-conflicting
 	that is, only one relation between them exists throughout all the gene trees
@@ -561,39 +447,23 @@ class Reln_TaxaPair(object):
 			elif (self.freq_count[reln_type] > 0) and (self.freq_count[reln_type] < listsum):
 				break
 		return outlist
-
+	
+	#----------------------------------	
 	"""
 	this function prints all the information associated with a couplet
 	"""
-	def _PrintRelnInfo(self, key, Output_Text_File):
-		level_val_diff_R1 = self.ALL_Reln_Level_Diff_Val_Count[0]
-		level_val_diff_R2 = self.ALL_Reln_Level_Diff_Val_Count[1]
-		level_val_denom = (level_val_diff_R1 + level_val_diff_R2)
-		level_val_diff = (level_val_diff_R1 - level_val_diff_R2)
-		
+	def _PrintRelnInfo(self, key, Output_Text_File, WEIGHT_TAXA_SUBSET):
 		fp = open(Output_Text_File, 'a')    
-		fp.write('\n\n\n taxa pair key: ' + str(key))
-		fp.write('\n relations [type/count/priority_reln/score]: ')
+		fp.write('\n\n\n taxa pair key: ' + str(key) + ' couplet:  ' + str(COMPLETE_INPUT_TAXA_LIST[key[0]]) \
+			+ ', ' + str(COMPLETE_INPUT_TAXA_LIST[key[1]]))
+		fp.write('\n relations [type/count]: ')
 		for i in range(4):
-			fp.write('\n [' + str(i) + '/' \
-				+ str(self.freq_count[i]) + '/' + str(self.priority_reln[i]) \
-				+ '/' + str(self.support_score[i]) + ']')
-		fp.write('\n Sorted freq list: ' + str(self.sorted_freq_count))
+			fp.write('\t [' + str(i) + '/' + str(self.freq_count[i]) + ']')
 		fp.write('\n AVERAGE Sum of excess gene **** : ' + str(self._GetAvgXLGeneTrees()))
-		#fp.write('\n Mode Sum of extra lineage **** : ' + str(self._GetMultiModeXLVal()))
-		#fp.write('\n Mean(Avg + Mode) of extra lineage **** : ' \
-			#+ str((self._GetAvgXLGeneTrees() + self._GetMultiModeXLVal()) / 2.0))
 		fp.write('\n No of supporting trees : ' + str(self.supporting_trees))
-		fp.write('\n ALL relation based Level diff info count (r1/r2/r3): ' \
-			+ str(self.ALL_Reln_Level_Diff_Info_Count))
-		fp.write('\n ALL relation based Level diff Val count (r1/r2/r3): ' \
-			+ str(self.ALL_Reln_Level_Diff_Val_Count))
-		fp.write('\n R4 relation pseudo (R1/R2) count: ' + str(self.freq_R4_pseudo_R1R2))
-		fp.write('\n Allowed relation list: ' + str(self.allowed_reln_list))
-		if (level_val_denom > 0):
-			fp.write('\n Level Val r1 reln ratio : ' + str((level_val_diff_R1 * 1.0) / level_val_denom))
-			fp.write('\n Level Val r2 reln ratio : ' + str((level_val_diff_R2 * 1.0) / level_val_denom))
-			fp.write('\n Level Val r3/r4 reln ratio : ' + str((math.fabs(level_val_diff)) / level_val_denom))
+		fp.write('\n Allowed reln list: ' + str(self.Allowed_Reln_List))
+		if (WEIGHT_TAXA_SUBSET == True):
+			fp.write('\n Underlying taxa indices list: ' + str(self.LCA_Underlying_Taxa_List))
 		fp.close()
 
 #-----------------------------------------------------
@@ -604,37 +474,73 @@ according to the rule of equivalence partition
 class Cluster_node(object):
 	def __init__(self, inp_taxa=None):
 		"""
+		these two lists are added by - sourya
+		they are initial R1 and R2 lists
+		"""
+		self.Initial_R1_List = []
+		self.Initial_R2_List = []
+		
+		#"""
+		#this is the final possible R2 list of the current cluster
+		#"""
+		#self.Final_PossibleR2List = []
+		"""
 		taxa list of the current cluster
 		"""
 		self.Species_List = [] 
 		"""
-		# set to 1 once the cluster is traversed during DFS order of traversing the clusters
+		set to 1 once the cluster is traversed during DFS order of traversing the clusters
 		this is required in printing the supertree in newick format 
 		"""
-		self.explored = 0    
+		self.explored = 0   
 		"""
-		stores the indices of clusters cy such that curr_clust->cy is achieved
+		stores the indices of clusters cy, such that, depending on the relation type:
+		curr_clust->cy /  cy->curr_clust / R3 (cy, curr_clust) / R4 (cy, curr_clust) are present
 		"""
-		self.out_edge_list = []
-		"""
-		stores the indices of clusters cy such that cy->curr_clust is achieved
-		"""
-		self.in_edge_list = []
-		"""
-		stores the indices of clusters cy such that cy and curr_clust 
-		are not related by any directed edge based connection
-		"""
-		self.no_edge_list = []
-		"""
-		stores the indices of clusters cy such that curr_clust->cy connection 
-		needs to be checked
-		"""
-		self.possible_R1_list = []
+		self.Reln_List = [[] for i in range(4)]
+		#"""
+		#stores the indices of clusters cy such that curr_clust->cy connection 
+		#needs to be checked
+		#"""
+		#self.possible_R1_list = []
+		#"""
+		#stores the indices of clusters cy such that curr_clust<-cy connection 
+		#needs to be checked
+		#"""
+		#self.possible_R2_list = []
+		#"""
+		#stores the indices of clusters cy such that curr_clust<----cy holds
+		#but curr_clust---->cy does not hold
+		#"""
+		#self.Distinct_possible_R2_list = []
 		"""
 		during initialization, append one tuple to this cluster
 		"""
 		if inp_taxa is not None:
 			self._Append_taxa(inp_taxa)    
+
+	##---------------------------------------------
+	#def _AppendInitialList(self, inp_reln, inp_clust):
+		#if (inp_reln == RELATION_R1):
+			#if inp_clust not in self.Initial_R1_List:
+				#self.Initial_R1_List.append(inp_clust)
+		#elif (inp_reln == RELATION_R2):
+			#if inp_clust not in self.Initial_R2_List:
+				#self.Initial_R2_List.append(inp_clust)
+
+	#def _GetInitialList(self, inp_reln):
+		#if (inp_reln == RELATION_R1):
+			#return self.Initial_R1_List
+		#elif (inp_reln == RELATION_R2):
+			#return self.Initial_R2_List
+
+	##---------------------------------------------
+	#def _AddFinalPossibleR2(self, inp_clust):
+		#if inp_clust not in self.Final_PossibleR2List:
+			#self.Final_PossibleR2List.append(inp_clust)
+		
+	#def _GetFinalPossibleR2List(self):
+		#return self.Final_PossibleR2List
 
 	#---------------------------------------------
 	"""
@@ -651,6 +557,7 @@ class Cluster_node(object):
 		
 	def _GetExploredStatus(self):
 		return self.explored
+
 	#---------------------------------------------
 	"""
 	following function modifies and returns (if required) 
@@ -666,103 +573,95 @@ class Cluster_node(object):
 	def _Append_taxa(self, inp_taxa):
 		if inp_taxa not in self.Species_List:
 			self.Species_List.append(inp_taxa)
+
+	def _Remove_taxa(self, inp_taxa):
+		if inp_taxa in self.Species_List:
+			self.Species_List.remove(inp_taxa)    
+
 	#---------------------------------------------
 	"""
 	returns the number of clusters cy such that cy->curr_clust connection is present
 	"""
 	def _Get_Indegree(self):
-		return len(self.in_edge_list)
+		#return len(self.in_edge_list)
+		return len(self.Reln_List[RELATION_R2])
 
 	"""
 	returns the number of clusters cy such that curr_clust->cy connection is present
 	"""
 	def _Get_Outdegree(self):
-		return len(self.out_edge_list)
+		#return len(self.out_edge_list)
+		return len(self.Reln_List[RELATION_R1])
 	
 	"""
-	returns the list of clusters cy such that curr_clust->cy connection is present
+	returns the list of cluster indices connected with the current cluster
+	via the relation "reln_type"
 	"""
-	def _GetOutEdgeList(self):
-		return self.out_edge_list
+	def _GetClustRelnList(self, reln_type):
+		return self.Reln_List[reln_type]
 	
 	"""
-	returns the list of clusters cy such that cy->curr_clust connection is present
+	appends one cluster index to the list of the specified "reln_type"
 	"""
-	def _GetInEdgeList(self):
-		return self.in_edge_list    
+	def _AddRelnInstance(self, reln_type, dest_clust_idx):
+		if (dest_clust_idx not in self.Reln_List[reln_type]):
+			self.Reln_List[reln_type].append(dest_clust_idx)
+	
+	"""
+	removes one cluster index to the list of the specified "reln_type"
+	"""
+	def _RemoveRelnInstance(self, reln_type, dest_clust_idx):
+		if dest_clust_idx in self.Reln_List[reln_type]:
+			self.Reln_List[reln_type].remove(dest_clust_idx)    
 
-	"""
-	returns the set of clusters cy such that there exists no directed edge 
-	between cy and curr_clust is present
-	"""
-	def _GetNoEdgeList(self):
-		return self.no_edge_list    
+	##--------------------------------------------------------
+	## add - sourya
+	#def _AddPossibleR1(self, dest_clust_idx):
+		#if dest_clust_idx not in self.possible_R1_list:
+			#self.possible_R1_list.append(dest_clust_idx)
 	
-	"""
-	adds one cluster cy in the list of clusters such that curr_clust->cy connection is present
-	"""
-	def _AddOutEdge(self, dest_clust_idx):
-		if dest_clust_idx not in self.out_edge_list:
-			self.out_edge_list.append(dest_clust_idx)
-		
-	"""
-	adds one cluster cy in the list of clusters such that cy->curr_clust connection is present
-	"""
-	def _AddInEdge(self, src_clust_idx):
-		if src_clust_idx not in self.in_edge_list:
-			self.in_edge_list.append(src_clust_idx)
+	#def _RemovePossibleR1(self, dest_clust_idx):
+		#if dest_clust_idx in self.possible_R1_list:
+			#self.possible_R1_list.remove(dest_clust_idx)
+			
+	#def _GetPossibleR1List(self):
+		#return self.possible_R1_list
 
-	"""
-	adds one cluster cy in the list of clusters such that there exists no directed edge 
-	between cy and curr_clust
-	"""
-	def _AddNoEdge(self, src_clust_idx):
-		if src_clust_idx not in self.no_edge_list:
-			self.no_edge_list.append(src_clust_idx)
-			
-	"""
-	removes one cluster cy in the list of clusters such that curr_clust->cy connection is now deleted
-	"""
-	def _RemoveOutEdge(self, dest_clust_idx):
-		if dest_clust_idx in self.out_edge_list:
-			self.out_edge_list.remove(dest_clust_idx)    
-		
-	"""
-	removes one cluster cy in the list of clusters such that cy->curr_clust connection is now deleted
-	"""
-	def _RemoveInEdge(self, dest_clust_idx):
-		if dest_clust_idx in self.in_edge_list:
-			self.in_edge_list.remove(dest_clust_idx)    
-		
-	"""
-	removes one cluster cy in the list of clusters such that information between no 
-	directed edge connection between the curr_clust and the cluster cy is now deleted
-	"""
-	def _RemoveNoEdge(self, dest_clust_idx):
-		if dest_clust_idx in self.no_edge_list:
-			self.no_edge_list.remove(dest_clust_idx)    
-			
-	#--------------------------------------------------------
-	# add - sourya
-	def _AddPossibleR1(self, dest_clust_idx):
-		if dest_clust_idx not in self.possible_R1_list:
-			self.possible_R1_list.append(dest_clust_idx)
+	#def _AddPossibleR2(self, dest_clust_idx):
+		#if dest_clust_idx not in self.possible_R2_list:
+			#self.possible_R2_list.append(dest_clust_idx)
 	
-	def _RemovePossibleR1(self, dest_clust_idx):
-		if dest_clust_idx in self.possible_R1_list:
-			self.possible_R1_list.remove(dest_clust_idx)
+	#def _RemovePossibleR2(self, dest_clust_idx):
+		#if dest_clust_idx in self.possible_R2_list:
+			#self.possible_R2_list.remove(dest_clust_idx)
 			
-	def _GetPossibleR1List(self):
-		return self.possible_R1_list
+	#def _GetPossibleR2List(self):
+		#return self.possible_R2_list
+	
+	#def _ComputeDistinctPossibleR2List(self):
+		#for x in self.possible_R2_list:
+			#if x not in self.possible_R1_list:
+				#self.Distinct_possible_R2_list.append(x)
+	
+	#def _GetDistinctPossibleR2List(self):
+		#return self.Distinct_possible_R2_list
+	
 	#--------------------------------------------------------
-		
-	def _PrintClusterInfo(self, key, Output_Text_File):
+	def _PrintClusterInfo(self, key, Output_Text_File, suppress=False):
 		fp = open(Output_Text_File, 'a')    
-		fp.write('\n cluster key: ' + str(key))
+		fp.write('\n\n cluster key: ' + str(key))
 		fp.write('\n species list: ' + str(self.Species_List))
-		#print 'its indegree: ', self.indegree
-		#print 'its outdegree: ', self.outdegree
-		fp.write('\n out edge list: ' + str(self.out_edge_list))
-		fp.write('\n in edge list: ' + str(self.in_edge_list))
-		fp.write('\n Possible R1 list: ' + str(self.possible_R1_list))
-		fp.close()    
+		#fp.write('\n (*** Initial) out edge list (R1): ' + str(self.Initial_R1_List))
+		#fp.write('\n (*** Initial) in edge list (R2): ' + str(self.Initial_R2_List))
+		if (suppress == False):
+			fp.write('\n out edge list (R1): ' + str(self.Reln_List[RELATION_R1]))
+			fp.write('\n in edge list (R2): ' + str(self.Reln_List[RELATION_R2]))
+			#fp.write('\n No edge list (R4): ' + str(self.Reln_List[RELATION_R4]))
+			#fp.write('\n Eq edge list (R3): ' + str(self.Reln_List[RELATION_R3]))
+			#fp.write('\n Possible R1 list: ' + str(self.possible_R1_list))
+			#fp.write('\n Possible R2 list: ' + str(self.possible_R2_list))
+			#fp.write('\n (Distinct) Possible R2 list: ' + str(self.Distinct_possible_R2_list))
+			#fp.write('\n *** (Final) Possible R2 list: ' + str(self.Final_PossibleR2List))
+		fp.close()
+
+	
